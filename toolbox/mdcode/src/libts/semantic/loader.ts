@@ -232,6 +232,10 @@ const actionSchema = z.object({
   description: z.string().optional(),
   executor: executorSchema,
   parameters: z.array(parameterSchema).optional(),
+  // Names of the constraints that gate this action. Kept as plain strings: they
+  // are resolved against the model's own constraints in validate.ts, which sees
+  // the whole model, whereas the schema sees one action.
+  guards: z.array(z.string()).optional(),
   ai_context: aiContextSchema.optional(),
   custom_extensions: z.array(customExtensionSchema).optional(),
 });
@@ -410,6 +414,7 @@ function buildDocumentSchema(bindingOptional: boolean, extended: boolean) {
                     description: z.string().optional(),
                     executor: executorSchema,
                     parameters: z.array(parameter).optional(),
+                    guards: z.array(z.string()).optional(),
                     ai_context: aiContextSchema.optional(),
                     ...ce,
                   }).strict();
@@ -708,6 +713,7 @@ function convertModel(
   const constraints = (m.constraints ?? []).map(convertConstraint);
   rejectDuplicateNames(
       constraints.map(c => c.name), 'constraint name', `model '${m.name}'`);
+  warnUnguardedParameterConstraints(actions, constraints, m.name, warnings);
 
   const description = composeDescription(m.description);
 
@@ -914,6 +920,12 @@ function convertAction(
     executor: convertExecutor(a.executor),
     parameters,
   };
+  if (a.guards?.length) {
+    // A repeated guard would check one constraint twice while reading as two
+    // rules, so it is rejected like any other duplicate name.
+    rejectDuplicateNames(a.guards, 'guard', `action '${a.name}'`);
+    action.guards = [...a.guards];
+  }
 
   const description = composeDescription(a.description);
   if (description) action.description = description;
@@ -922,6 +934,58 @@ function convertAction(
   const ce = toCustomExtensions(a.custom_extensions);
   if (ce) action.customExtensions = ce;
   return action;
+}
+
+// A constraint that reads an action's parameter describes that call, so the
+// only moment it can be checked is before the call runs -- which happens only
+// when the action names it in `guards`. Such a constraint left unnamed by EVERY
+// action is text nothing will ever evaluate, so say so at load time.
+//
+// Being guarded anywhere is enough. An action that shares the parameter name and
+// does not name the constraint is a deliberate modeling choice, since the same
+// rule may gate one action and leave another alone; warning about it would
+// report a constraint that does run and would teach an author to ignore this
+// message.
+//
+// This warns rather than fails because the scan matches identifiers, and an
+// expression may use a bare name that merely coincides with a parameter name.
+// One message per pair, naming the first parameter that matched.
+function warnUnguardedParameterConstraints(
+    actions: Action[], constraints: Constraint[], modelName: string,
+    warnings: string[]): void {
+  if (!actions.length || !constraints.length) return;
+  for (const c of constraints) {
+    if (actions.some(a => a.guards?.includes(c.name))) continue;
+    const identifiers = bareIdentifiers(c.expression);
+    if (!identifiers.size) continue;
+    for (const a of actions) {
+      const read = a.parameters.find(p => identifiers.has(p.name));
+      if (!read) continue;
+      warnings.push(
+          `model '${modelName}': constraint '${c.name}' reads '${read.name}', ` +
+          `a parameter of action '${a.name}', but '${a.name}' does not list ` +
+          `'${c.name}' in guards. A constraint over an action's parameters is ` +
+          `checked only as a guard of that action.`);
+    }
+  }
+}
+
+// The names an expression uses on their own. A qualified `Entity.field` is
+// consumed whole so its field half is never mistaken for a bare name, which is
+// what makes `Part.availableStock >= quantity` yield `quantity` alone. Action
+// parameters are referenced by bare name, so this is the set that can name one.
+//
+// A quoted literal is data rather than a reference, so it is blanked before the
+// scan: `status = 'quantity'` must not look like a read of a parameter named
+// `quantity`.
+function bareIdentifiers(expression: string): Set<string> {
+  const found = new Set<string>();
+  const code = expression.replace(/'[^']*'|"[^"]*"/g, ' ');
+  const token = /[A-Za-z_]\w*\s*\.\s*[A-Za-z_]\w*|([A-Za-z_]\w*)/g;
+  for (let m = token.exec(code); m; m = token.exec(code)) {
+    if (m[1]) found.add(m[1]);
+  }
+  return found;
 }
 
 // Resolves a parameter's authored `type` against the ontology: a known entity

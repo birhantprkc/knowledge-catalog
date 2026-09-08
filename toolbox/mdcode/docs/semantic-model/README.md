@@ -125,17 +125,20 @@ A model can also declare **actions**: model-level write operations, the
 write-side counterpart to a metric. An action names a business operation, points
 at the executor that carries it out (an MCP tool, a REST endpoint, or a gRPC
 method), and types each parameter against the ontology, so an entity-typed
-parameter is an object reference rather than a bare string. Knowledge Catalog is
-the only system an action reaches, and where it is governed. See
+parameter is an object reference rather than a bare string. An action also
+names, in `guards`, the constraints that gate it. Knowledge Catalog is the only
+system an action reaches, and the only place it is governed. See
 [Modeling write operations](actions.md).
 
 A model can also state **constraints**: named boolean invariants over the
 ontology that hold for every instance, whatever writes to the model. A
 constraint is part of what the model asserts, written in the same expression
 language as a metric, and `Account.balance >= 0` is as much a fact about an
-account as the fields beside it. A constraint reaches Knowledge Catalog only: it
-is validated, published there, and read back by `pull`. No component checks one
-against live data yet.
+account as the fields beside it. A constraint that reads an action's parameters
+describes one call rather than the stored data. It can be checked only before
+that call runs, so the action names it in `guards`. A constraint reaches
+Knowledge Catalog only: it is validated, published there, and read back by
+`pull`. No component checks one against live data yet.
 
 This model names no table and no store, so it is complete enough to govern in
 Knowledge Catalog as-is (step 2). Where each entity reads from — the store and the

@@ -17,23 +17,8 @@ the data this model describes, and you want that operation described where the
 data is described. Anything reading the model then knows the operation exists,
 what it takes, and where it lives.
 
-Do not declare an action for a question about the data; that is a
-[metric](README.md#1-author-the-logical-model). Do not expect an action to run: `kcmd`
-publishes the declaration and never calls the executor. What each caller has to
-supply is covered in [What is not modeled yet](#what-is-not-modeled-yet).
-
-## The one thing the model adds
-
-A hand-written tool schema can already say that an input is an integer or a
-string. Only a model that knows the ontology can say what an input *denotes*:
-
-> **A parameter typed by an entity is an object reference.**
-
-`{name: source, type: Account}` says the argument names an account. The loader
-resolves `Account` against the model's entities and marks the parameter as an
-entity reference, so a consumer generating a tool schema knows to accept an
-identifier and resolve it against `Account`'s key rather than pass a number
-through. A parameter typed by a scalar datatype is an ordinary value.
+An action does not answer a question about the data. Use a
+[metric](README.md#1-author-the-logical-model) for that.
 
 ## 1. Declare the action
 
@@ -85,21 +70,90 @@ The executor says where the operation lives. `mcp` (`{server, tool}`) references
 a tool already registered in Agent Registry by the server's resource name plus
 the tool's name within it. `rest` (`{endpoint, method}`) and `grpc`
 (`{service, method}`) are the other kinds, and exactly one kind is required.
-Naming two is a parse error: `executor requires exactly one kind, but 2 given
-(mcp, rest)`.
 
 `description` and `ai_context.instructions` are both carried through to the
 catalog. Write the instructions for the agent that will call the action, as
 above.
 
-## 2. Check it before pushing
+### What an entity-typed parameter adds
+
+A hand-written tool schema can say that an input is an integer or a string. A
+parameter typed against the model says what the input *denotes*:
+
+> **A parameter typed by an entity is an object reference.**
+
+`{name: source, type: Account}` says the argument names an account, so a
+consumer generating a tool schema knows to accept an identifier and resolve it
+against `Account`'s key rather than pass a number through. A parameter typed by
+a scalar datatype, such as `amount` above, is an ordinary value.
+
+## 2. Gate it with a constraint
+
+A **constraint** is a named boolean invariant a model states over its ontology.
+An action needs none; declare one when a rule decides whether a call may proceed
+at all. Where a constraint applies depends on what its expression reads.
+
+An expression over stored data holds for every write, whatever performed that
+write. No action has to name such a constraint:
+
+```yaml
+    constraints:
+      - name: BalanceStaysPositive
+        expression: Account.balance >= Account.minimumBalance
+        description: >-
+          An account cannot be taken below its minimum balance.
+```
+
+An expression that reads an action's **parameters** describes one call rather
+than the stored data. The only moment it can be checked is before that call
+runs, so the action names it in `guards`:
+
+```yaml
+    constraints:
+      - name: AmountIsPositive
+        expression: amount > 0
+        description: >-
+          A transfer must move at least one unit. Ask the caller for the
+          amount again before retrying.
+    actions:
+      - name: TransferFunds
+        executor:
+          mcp:
+            server: //agentregistry.googleapis.com/projects/acme-ops/locations/us-central1/mcpServers/payments
+            tool: transfer_funds
+        parameters:
+          - { name: source, type: Account }
+          - { name: target, type: Account }
+          - { name: amount, type: Float }
+        guards: [AmountIsPositive]
+```
+
+`guards` holds the names of constraints the same model declares. Naming one adds
+an earlier check; it does not switch enforcement on. An invariant over stored
+data is in force whether or not an action names it, so `guards` exists for the
+constraints that have no other moment to run. Naming an invariant over stored
+data as a guard is still useful. It states that the call must not proceed on
+data that is already broken, and it puts that check before the call.
+
+The reference lives on the action rather than on the constraint, because the
+same rule may gate `TransferFunds` and leave `CloseAccount` alone.
+
+`kcmd` reports a mismatch from either side. A guard that names no constraint
+fails the push. A constraint over parameters that no action names loads with a
+warning, because nothing will ever evaluate it.
+
+**Status: nothing evaluates a guard yet.** `kcmd` parses `guards`, resolves each
+name, publishes the list, and reads it back. No component checks a guard against
+live data, so a guard states what must hold before the call and blocks no call.
+
+## 3. Check it before pushing
 
 ```bash
 kcmd push --validate-only
 ```
 
-Two things about an action can be statically wrong once the document parses, and
-both are hard errors:
+Three things about an action can be statically wrong once the document parses,
+and each one is a hard error:
 
 ```
 action 'TransferFunds' in model 'payments' (payments.yaml) has parameter
@@ -108,34 +162,39 @@ datatype.
 
 action 'TransferFunds' in model 'payments' (payments.yaml) has an mcp executor
 whose 'tool' is missing or blank.
+
+action 'TransferFunds' in model 'payments' (payments.yaml) is guarded by
+'AmountIsPostive', but model 'payments' declares no constraint of that name.
 ```
 
 A parameter type that resolves to neither an entity nor a scalar means the model
 cannot say what that argument denotes, which is the whole contribution an action
 makes. An executor missing a coordinate cannot be dispatched by whatever picks
-the action up. Both checks are static, so they run on every push whatever the
-destination.
+the action up. A guard that names no constraint — `AmountIsPostive` here, a
+misspelling of the `AmountIsPositive` declared above — leaves the author
+believing the write is checked when nothing checks it. All three checks are
+static, so they run on every push whatever the destination.
 
-An executor coordinate that is absent altogether is caught earlier, when the
-document is parsed, so the message above is what a blank one produces.
-
-## 3. Push it
+## 4. Push it
 
 ```bash
 kcmd push
 ```
 
-Knowledge Catalog is the only system an action reaches. Every other push
-target deploys nothing for it and warns once:
+Knowledge Catalog is the only system an action reaches. Every other push target
+deploys nothing for it and warns once:
 
 ```
 Warning: [payments] 1 action(s) reach Knowledge Catalog only; the BigQuery
 push deploys none of them.
 ```
 
-Knowledge Catalog is where actions land. Each action becomes its own entry,
-parented to the model entry, exactly as a metric does. The entry carries one
-aspect holding the executor and the typed parameters:
+A graph-only `kcmd push --no-kc` therefore validates the actions and then warns
+that they will not be deployed.
+
+In Knowledge Catalog, each action becomes its own entry, parented to the model
+entry, the same way a metric does. The entry carries one aspect holding the
+executor and the typed parameters:
 
 ```yaml
 # .../entryGroups/<group>/entries/payments.actions.TransferFunds
@@ -156,51 +215,41 @@ aspects:
     instructions: Resolve both accounts before calling. Name the account the money leaves as `source`.
 ```
 
-The `semantic-action` entry type and aspect type are the one pair `kcmd` creates
-rather than references. Every other element of a model maps to a built-in system
-type under `dataplex-types/global`; there is no built-in type for an action yet,
-so `kcmd init --semantic-model` provisions the pair in your own project at
-`global`, beside the entry group. A later push writes only entries.
+Removing an action from the document deletes its entry on the next push, because
+the model owns the `<model>.actions.` id prefix. A catalog search can list the
+actions in a project by entry type, the way it lists entities or metrics.
 
-Two consequences follow from the entry shape. A catalog search can list the
-actions in a project by entry type, the way it lists entities or metrics. And
-removing an action from the document deletes its entry on the next push, because
-the model owns the `<model>.actions.` id prefix.
-
-Because Knowledge Catalog is the only destination an action has, a graph-only
-push has nowhere to put one. `kcmd push --no-kc` validates the actions and then
-warns that they will not be deployed.
+`semantic-action` is a custom entry type, because Dataplex has no built-in type
+for an action yet. `kcmd init --semantic-model` provisions the entry type and
+its aspect type in your own project. Run init once before the first push of a
+model that declares actions.
 
 Publishing an action needs the permission to attach its aspect, in addition to
 the permissions any push needs — see
 [Reference → Permissions](reference.md#permissions).
 
-## 4. Pull it back
+## 5. Pull it back
 
 ```bash
 kcmd pull
 ```
 
 Pull collects the `semantic-action` entries under the model entry and rebuilds
-each action, so a name, a description, an executor, typed parameters, and
-`ai_context.instructions` survive the round trip unchanged. `isEntityRef` is
-re-derived against the entities the pull recovered rather than read back, so it
-stays consistent with the model you get. What every part of a model does and
-does not survive is in
+each action, so a name, a description, an executor, typed parameters, its
+`guards`, and `ai_context.instructions` survive the round trip unchanged. What
+every part of a model does and does not survive is in
 [What push and pull preserve](fidelity.md).
 
 ## What is not modeled yet
 
-This is a prototype. Four things a reader reasonably expects are absent, and
-knowing which they are decides how much you can lean on it.
+This is a prototype. Four things a reader reasonably expects are absent.
 
-- **An action declares no precondition and no effects.** `precondition` (what
-  has to hold before the call) and `affects` (what the call changes) are out of
-  scope here. Model-level **constraints** state the invariants a model requires,
-  and no constraint is attached to an action.
-- **Nothing checks the write.** No component evaluates a constraint, so an action
-  is a declaration and the correctness of what the executor does belongs to the
-  executor.
+- **An action declares no effects.** `affects` — what the call changes — is out
+  of scope here. What must hold *before* the call is modeled: a constraint the
+  action names in [`guards`](#2-gate-it-with-a-constraint).
+- **Nothing checks the write.** No component evaluates a constraint or a guard,
+  so an action is a declaration and the correctness of what the executor does
+  belongs to the executor.
 - **`kcmd` does not call the executor.** Push publishes the action. Dispatching
   it is the job of whatever reads the model, which is why the executor names
   coordinates rather than a statement.

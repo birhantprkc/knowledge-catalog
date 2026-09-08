@@ -100,8 +100,14 @@ agree on every structural row and differ only where a Spanner target has no
 12. **Actions.** An action reaches Knowledge Catalog only, as one
     `semantic-action` entry under the model entry, and `pull` reads it back from
     that entry. Every other push target deploys nothing for it and warns once.
-    Prototype scope: an action's `precondition` and `affects` are not modelled,
-    so nothing about them is stored. See
+    Its `guards` are stored as constraint names and round-trip verbatim. A name
+    whose constraint is absent from a pull is kept rather than dropped, so a
+    partial pull never silently rewrites the author's model; the pull warns
+    about the name it kept, and a push rejects the model until the constraint
+    is back. A name the aspect repeats is the one exception, dropped to its
+    single occurrence because the loader rejects a repeat and the document has
+    to stay loadable. Prototype scope: an action's `affects` is not modelled,
+    so nothing about it is stored. See
     [Modeling write operations](actions.md).
 13. **Constraints.** A constraint reaches Knowledge Catalog only, as one
     `semantic-constraint` entry under the model entry, and `pull` reads it back.
@@ -141,12 +147,14 @@ imported from). Those stay in your authored document; the vendor SQL and
 expressions are still used when generating graph SQL.
 
 **Actions** follow the same one-entry-per-element rule as everything else: each
-becomes a `semantic-action` entry under the model entry, carrying its executor
-and typed parameters in a `semantic-action` aspect. They round-trip losslessly
-through `pull` (name, description, executor, typed parameters, and
-`instructions`). Their `precondition` / `affects` are out of scope for this
-prototype and are not stored. The entry type is custom, so `kcmd init` creates
-it; a model that declares no action never needs it.
+becomes a `semantic-action` entry under the model entry, carrying its executor,
+typed parameters, and `guards` in a `semantic-action` aspect. They round-trip
+losslessly through `pull` (name, description, executor, typed parameters,
+`guards`, and `instructions`). A parameter's `isEntityRef` is re-derived against
+the entities the pull recovered rather than read back from the aspect, so it
+stays consistent with the model the pull hands you. Their `affects` is out of
+scope for this prototype and is not stored. The entry type is custom, so `kcmd
+init` creates it; a model that declares no action never needs it.
 
 **Constraints** publish the same way: each becomes a `semantic-constraint` entry
 under the model entry, with the expression and any `instructions` in a
