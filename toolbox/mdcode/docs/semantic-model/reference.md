@@ -408,7 +408,11 @@ and [§4.1](model_spec.md#41-narrowings-stricter-than-ossie).
   like `OrderedAs.quantity`, a metric reference, or compound logic — is left
   alone rather than guessed at, so a valid constraint is never falsely rejected.
   Like an action, a constraint reaches Knowledge Catalog only, and a `--no-kc`
-  push warns that it will not be deployed. *(static)*
+  push warns that it will not be deployed. Two rules are enforced at parse time:
+  `on_violation` and `severity` are each a closed vocabulary — `reject` /
+  `escalate` / `warn` and `critical` / `high` / `medium` / `low` — so an
+  unrecognized word is a hard load error rather than a value that publishes and
+  means nothing. *(static)*
 * **A constraint over an action's parameters is guarded.** A constraint whose
   expression reads a bare name that is a parameter of some action describes that
   call rather than the stored data, so it can be checked only before the call

@@ -7,11 +7,13 @@
 # scalar ones. The model also names a BigQuery deployment target, so a push
 # exercises the leg that deploys neither an action nor a constraint.
 #
-# The three constraints cover every validation path. NonNegativeOrderTotal opens
+# The four constraints cover every validation path. NonNegativeOrderTotal opens
 # with a KNOWN entity, so its field is checked. PositiveQuantity opens with
 # `OrderedAs`, which is no entity, so it is left to the evaluator rather than
 # falsely rejected. RequestedQuantityIsPositive reads the action's `quantity`
-# parameter, so PlaceOrder names it in `guards`.
+# parameter, so PlaceOrder names it in `guards`. OrderWithinStandingLimit is the
+# only one to state the two routing words, so the goldens show `on_violation`
+# and `severity` making the round trip while the other three show their absence.
 #
 # PlaceOrder's `affects` covers every authored shape at once: an entry on an
 # entity narrowed to the fields it writes, an entry on a relationship, and the
@@ -21,12 +23,14 @@
 # OSI golden shows the normalization: the first two keep their record, the
 # third stays a bare name.
 #
-# Those last two are one business rule in its two bindings. The invariant holds
-# over stored order lines, whatever wrote them. The guard holds over the
-# argument a caller passed, and can be checked only before the call runs, which
-# is why a guard has to be named by the action and an invariant does not.
+# PositiveQuantity and RequestedQuantityIsPositive are one business rule in its
+# two bindings. The invariant holds over stored order lines, whatever wrote
+# them. The guard holds over the argument a caller passed, and can be checked
+# only before the call runs, which is why a guard has to be named by the action
+# and an invariant does not.
 #
-# They also cover both annotation shapes, which land in different places.
+# The constraints also cover both annotation shapes, which land in different
+# places.
 # NonNegativeOrderTotal declares a full `ai_context` beside its description --
 # instructions, synonyms and examples -- so the catalog golden shows the
 # description on the entry source and the whole `ai_context` on the aspect.
