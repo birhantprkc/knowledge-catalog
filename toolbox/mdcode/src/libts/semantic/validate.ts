@@ -11,7 +11,7 @@
 import {BigQueryClient} from '../gcp/bigquery';
 
 import {googleDeploymentTargets} from './deploy_bigquery';
-import {Action, Executor, generatedKeyParam, SemanticModel, SQL_EXECUTOR_VERBS} from './ir';
+import {Action, Constraint, Executor, generatedKeyParam, SemanticModel, SQL_EXECUTOR_VERBS} from './ir';
 import {LoadedModel} from './loader';
 import {resolveInheritance} from './resolve_inheritance';
 import {referencedParameters} from './sql_identifiers';
@@ -118,6 +118,26 @@ export function validatePushRequirements(
       }
     }
 
+    // Resolving inheritance throws on an `extends` naming an entity the model
+    // does not declare, and the two checks below stand down rather than
+    // stack-trace on one. Standing down has to mean reporting somewhere or it
+    // means publishing a broken model in silence: the loader accepts such a
+    // model, and a Knowledge-Catalog-only push reaches no graph leg that would
+    // resolve inheritance and catch it. So the failure is reported here, once
+    // per model, and the checks below stay quiet about it. A profile push that
+    // pruned fields is exempt for the same reason those checks are -- pruning
+    // can remove a supertype whole, and the dangling `extends` it leaves is the
+    // pruner's doing rather than the author's.
+    if (!opts.fieldsPruned) {
+      const failure = inheritanceFailure(model);
+      if (failure) {
+        errors.push(
+            `model '${model.name}' (${document}): ${failure} Constraint and ` +
+            `action checks that need the resolved model are skipped until ` +
+            `this is fixed.`);
+      }
+    }
+
     // An action reaches Knowledge Catalog only, so its checks are
     // target-independent: each parameter's type must resolve to something in
     // the ontology, the executor must carry the coordinates a runtime needs to
@@ -157,15 +177,10 @@ function validateActions(
   if (!actions.length) return errors;
   const constraintNames =
       new Set((model.constraints ?? []).map(c => c.name));
-  // Built only when an `affects` entry will actually read it, which is not a
-  // cost argument: declaredFields resolves inheritance, and that THROWS on an
-  // `extends` naming an entity the model does not declare. The loader accepts
-  // such a model, a KC-only push reaches no graph leg to catch it, and a
-  // profile push can create one by pruning a supertype whole. Building this
-  // eagerly would turn any of those into a stack trace out of the validation
-  // gate, for a model this check has nothing to say about.
+  // Built only when an `affects` entry will actually read it, and through
+  // `ifResolvable` because declaredConcepts resolves inheritance.
   const concepts = !fieldsPruned && actions.some(a => a.affects?.length) ?
-      declaredConcepts(model) :
+      ifResolvable(() => declaredConcepts(model)) :
       undefined;
   for (const action of actions) {
     const where =
@@ -347,11 +362,24 @@ function declaredConcepts(model: SemanticModel): Map<string, DeclaredConcept> {
 }
 
 
-// Static, target-independent checks for a model's constraints. Two checks:
+// Static, target-independent checks for a model's constraints.
+//
+// First, every constraint must declare exactly one body. `expression` says the
+// rule can be computed and `judgment` says it cannot, so a constraint with both
+// answers neither, and one with neither states no rule at all.
+//
+// An `expression` then gets two checks:
 //   - the expression must be non-empty;
-//   - when it opens with a `<Entity>.<field>` qualifier naming a KNOWN entity,
-//     that entity must declare the field. This catches a typo that would
-//     otherwise surface only inside an agent's rejected action.
+//   - every `<Entity>.<field>` token naming a KNOWN entity must name a field
+//     that entity declares. This catches a typo that would otherwise surface
+//     only inside an agent's rejected action.
+// A `judgment` gets the same field-reference check over the qualified tokens in
+// its prose, plus the one routing rule in judgedConstraintErrors.
+//
+// Both bodies are scanned the same way, because a rule is as easy to misspell
+// in `amount <= Order.totl` as in a sentence, and an expression that names a
+// field no entity has can never be computed.
+//
 // Everything else is left alone. The expression is a logical invariant, and
 // whatever evaluates it resolves it against the ontology. So a leading
 // qualifier that is not a known entity is not guessed at here: a
@@ -373,25 +401,196 @@ function validateConstraints(
   const errors: string[] = [];
   const constraints = model.constraints ?? [];
   if (!constraints.length) return errors;
-  const fieldsByEntity = fieldsPruned ? undefined : declaredFields(model);
+  const fieldsByEntity =
+      fieldsPruned ? undefined : ifResolvable(() => declaredFields(model));
+  // Names the model declares that are not fields of any one entity, which a
+  // token's tail may legitimately carry. See unknownFieldRefs.
+  const nonFieldNames = new Set([
+    ...(model.relationships ?? []).map(r => r.name),
+    ...(model.metrics ?? []).map(m => m.name),
+  ]);
 
   for (const c of constraints) {
     const where =
         `constraint '${c.name}' in model '${model.name}' (${document})`;
-    if (!c.expression.trim()) {
+    const hasExpression = c.expression !== undefined;
+    const hasJudgment = c.judgment !== undefined;
+    if (hasExpression && hasJudgment) {
+      errors.push(
+          `${where} declares both an expression and a judgment. A constraint ` +
+          `states one rule in one body: use 'expression' when the rule can be ` +
+          `computed, 'judgment' when it cannot.`);
+      continue;
+    }
+    if (!hasExpression && !hasJudgment) {
+      errors.push(
+          `${where} declares neither an expression nor a judgment. Give it ` +
+          `one: 'expression' when the rule can be computed, 'judgment' when ` +
+          `it cannot.`);
+      continue;
+    }
+
+    if (hasJudgment) {
+      errors.push(
+        ...judgedConstraintErrors(c, where, fieldsByEntity, nonFieldNames));
+      continue;
+    }
+
+    if (!c.expression!.trim()) {
       errors.push(`${where} has an empty expression.`);
       continue;
     }
-    if (!fieldsByEntity) continue;
-    const ref = leadingFieldRef(c.expression);
-    if (!ref) continue;
-    const fields = fieldsByEntity.get(ref.entity);
-    if (fields && !fields.has(ref.field)) {
-      errors.push(`${where} references '${ref.entity}.${ref.field}', but ` +
-          `entity '${ref.entity}' declares no field '${ref.field}'.`);
-    }
+    // A quoted literal is data rather than a reference, so it is blanked
+    // before the scan: `status = 'Order.total'` compares against a string.
+    errors.push(...unknownFieldRefs(
+        c.expression!.replace(/'[^']*'|"[^"]*"/g, ' '), where, fieldsByEntity,
+        nonFieldNames));
   }
   return errors;
+}
+
+// What a judged constraint must satisfy, beyond stating a body at all.
+//
+// It must say what a violation does. Any of the three words is allowed,
+// `reject` included, but silence is not: an unmarked constraint rejects, and
+// inheriting the harshest consequence by omission is the one outcome an author
+// of a judged rule is least likely to have meant. Nothing here reads the prose
+// to check the word against it -- the prose is prose, and a check that asked a
+// model whether a sentence means refusal would be no guardrail at all.
+//
+// The other check resolves the `Entity.field` tokens the prose mentions, which
+// is the whole of the static checking a judged rule can get.
+function judgedConstraintErrors(
+    c: Constraint, where: string,
+    fieldsByEntity: Map<string, Set<string>>|undefined,
+    nonFieldNames: Set<string>): string[] {
+  const errors: string[] = [];
+  // The two checks are independent, so an empty judgment does not skip the
+  // routing one. Reporting only the empty body would send the author back for a
+  // second failure over a key they were never told about.
+  const empty = !c.judgment!.trim();
+  if (empty) {
+    errors.push(`${where} has an empty judgment.`);
+  }
+  if (c.onViolation === undefined) {
+    errors.push(
+        `${where} is judged, so it must state on_violation: 'reject' to ` +
+        `refuse the write, 'escalate' to hold it for a person, or 'warn' to ` +
+        `let it through and report it. An unmarked constraint rejects, which ` +
+        `is too strong a thing to inherit by leaving the key out.`);
+  }
+  if (!empty) {
+    errors.push(...unknownFieldRefs(
+        c.judgment!, where, fieldsByEntity, nonFieldNames));
+  }
+  return errors;
+}
+
+// Every `Entity.field` token in a judgment whose entity the model declares and
+// whose field it does not.
+//
+// What makes a token a reference is that the model declares the entity, so no
+// spelling heuristic is needed and none is used: entity names here are as often
+// lowercase (`customer`, `orders`) as capitalized, and a rule keyed on the
+// capital would check some models and quietly skip others. An unrecognized
+// entity name is left alone on the principle that keeps this scan
+// conservative -- a rule may name a concept from another system, and
+// refusing to guess is what stops a valid rule being falsely rejected. A known
+// entity with an unknown field is the case where the author plainly meant this
+// model and got the name wrong, so that one is an error.
+
+// An entity that declares no fields at all is unknowable in the same way an
+// unrecognized name is, so the scan stands down there too. Fields are optional
+// on an entity, and a logical model bound to nothing but Knowledge Catalog
+// routinely declares none; reading an empty set as "this entity has no such
+// field" would refuse every constraint such a model can write.
+//
+// A tail that names something the model declares is not a misspelled field
+// either. Traversal has no syntax in the model today, so a prose token like
+// `Customer.Order` or `LineItem.BelongsTo` reads as a field of the head and
+// would be rejected for a field the author never claimed existed; the same goes
+// for `Order.total_revenue`, where metrics are model-level and the qualifier is
+// the entity the metric hangs off. The scan therefore settles only the case it
+// can: a tail the model does not declare under any kind is the misspelling.
+//
+// The two segments must be adjacent to the dot, which is what keeps a sentence
+// boundary ("check the memo. Every credit...") out of the scan. A decimal
+// number cannot survive either, since no entity is named `30`.
+function unknownFieldRefs(
+    judgment: string, where: string,
+    fieldsByEntity: Map<string, Set<string>>|undefined,
+    nonFieldNames: Set<string>): string[] {
+  if (!fieldsByEntity) return [];
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  const token = /\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)/g;
+  for (let m = token.exec(judgment); m; m = token.exec(judgment)) {
+    const [, entity, field] = m;
+    // A token with a third segment (`Order.lineItems.amount`) is a path rather
+    // than a field of `Order`, and reading its middle segment as one would
+    // reject it for a field the author never claimed existed. Nothing in the
+    // model defines path syntax today, so the scan declines to guess in both
+    // directions: a token followed by another dotted segment is skipped, and so
+    // is one preceded by a dot, which is how the tail of a path presents.
+    const after = judgment.slice(m.index + m[0].length);
+    if (/^\.\w/.test(after) || (m.index > 0 && judgment[m.index - 1] === '.')) {
+      continue;
+    }
+    const fields = fieldsByEntity.get(entity);
+    if (!fields || !fields.size || fields.has(field)) continue;
+    // The tail names something the model declares that is not a field of the
+    // head: another entity, a relationship, or a metric. `Customer.Order` and
+    // `LineItem.BelongsTo` are traversals and `Order.total_revenue` is a metric
+    // reference, none of which this scan can settle, and all of which an author
+    // writing prose reaches for. Only a tail the model does not declare at all
+    // is read as the misspelling this check exists to catch.
+    if (fieldsByEntity.has(field) || nonFieldNames.has(field)) continue;
+    const ref = `${entity}.${field}`;
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    errors.push(
+        `${where} references '${ref}', but entity '${entity}' declares no ` +
+        `field '${field}'.`);
+  }
+  return errors;
+}
+
+// What `build` returns, or nothing when the model's inheritance does not
+// resolve.
+//
+// `declaredFields` and `declaredConcepts` both resolve inheritance, and
+// resolving THROWS on an `extends` naming an entity the model does not declare
+// rather than reporting it. The loader accepts such a model, a
+// Knowledge-Catalog-only push reaches no graph leg to catch it, and a profile
+// push can create one by pruning a supertype whole. A validation gate reports;
+// it does not stack-trace, so every caller that resolves inheritance to answer
+// a question comes through here and stands its own check down when the answer
+// is unavailable. That is the same thing a pruned profile does. Standing down
+// is not silence: validatePushRequirements reports the resolution failure once
+// per model, so the larger problem is named and only the checks that depend on
+// the resolved model go quiet.
+function ifResolvable<T>(build: () => T): T|undefined {
+  try {
+    return build();
+  } catch {
+    return undefined;
+  }
+}
+
+// Why resolving the model's inheritance fails, or nothing when it succeeds.
+//
+// Reported rather than thrown, and reported once for the model rather than once
+// per check that needed it. A model declaring no inheritance cannot fail, and
+// resolving clones, so it is not asked.
+function inheritanceFailure(model: SemanticModel): string|undefined {
+  if (!(model.entities ?? []).some(e => e.extends?.length)) return undefined;
+  try {
+    resolveInheritance(model);
+    return undefined;
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return message.endsWith('.') ? message : `${message}.`;
+  }
 }
 
 // Every field each entity has, inherited ones included. Inheritance is resolved
@@ -404,13 +603,6 @@ function declaredFields(model: SemanticModel): Map<string, Set<string>> {
       (inherits ? resolveInheritance(model).model : model).entities ?? [];
   return new Map(
       entities.map(e => [e.name, new Set((e.fields ?? []).map(f => f.name))]));
-}
-
-// The leading `<name>.<field>` qualifier of a constraint expression, or null
-// when it does not open with one.
-function leadingFieldRef(expr: string): {entity: string; field: string}|null {
-  const m = expr.trim().match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)/);
-  return m ? {entity: m[1], field: m[2]} : null;
 }
 
 // The executor coordinate fields that are absent or blank. An executor with no

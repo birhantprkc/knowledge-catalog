@@ -64,11 +64,12 @@ export interface SemanticModel {
   // absent on models authored before actions existed, so consumers read it as
   // `actions ?? []`. See Action.
   actions?: Action[];
-  // Named invariants over the ontology: a boolean `expression` that must hold
-  // for every instance (e.g. `Customer.accountBalance >= 0`). Model-level, like
-  // metrics and actions. Optional, and absent on models authored before
-  // constraints existed, so consumers read it as `constraints ?? []`. See
-  // Constraint.
+  // Named invariants over the ontology, each stating one condition that must
+  // hold for every instance -- as a boolean `expression` a query can compute
+  // (`Customer.accountBalance >= 0`), or as a `judgment` in words for a rule no
+  // expression decides. Model-level, like metrics and actions. Optional, and
+  // absent on models authored before constraints existed, so consumers read it
+  // as `constraints ?? []`. See Constraint.
   constraints?: Constraint[];
   // Vendor extension blocks carried verbatim (round-trip fidelity), including the
   // model-level GOOGLE block. A typed deployment-target view is derived by the
@@ -320,12 +321,15 @@ export interface Action {
   // Inputs, each typed by the ontology: an entity type is an object reference,
   // a scalar type an ordinary value. See ActionParameter.
   parameters: ActionParameter[];
-  // The constraints that gate this action, by name. A constraint reaches this
-  // list only when it has to: one that reads an action's parameters describes
-  // the call rather than the data, so the only moment it can be checked is
-  // before that call runs. A constraint over data alone holds for every write
-  // and needs no reference here. Naming a constraint adds an earlier check and
-  // does not switch its enforcement on.
+  // The constraints that gate this action, by name. This list is what gives a
+  // constraint effect over the action. A constraint no action names is a
+  // catalogued rule that no call consults, so adding one to a model cannot
+  // silently start refusing calls that succeeded before it was published.
+  //
+  // Both kinds of rule belong here. One reading the action's parameters has no
+  // other moment to run. One over stored data, guarded, says the call must not
+  // proceed from a state that is already broken -- which is less than the rule
+  // itself says, because nothing binds a check to the state a write produces.
   guards?: string[];
   // What the call changes: its blast radius, one entry per concept touched.
   // Declared rather than derived, because the executor is opaque -- nothing
@@ -477,7 +481,7 @@ export interface GrpcExecutor {
  *
  *   - `reject`   the write is refused. Nobody is allowed to approve it, which
  *                is what makes the rule an invariant rather than a policy.
- *   - `escalate` the write is held and a human decides. The rule is a business
+ *   - `escalate` the write is held and a person decides. The rule is a business
  *                threshold, so somebody is allowed to say yes.
  *   - `warn`     the write proceeds and the violation is reported.
  *
@@ -494,6 +498,33 @@ export interface GrpcExecutor {
  *
  * `escalate` names that an approver exists. It does not name who: an approver
  * role is not modeled yet.
+ *
+ * The consequence is a field rather than something a `judgment` states in its
+ * own prose, because three things need it without running a judge. An
+ * unrunnable judge -- none configured, a failed call, a timeout -- still has to
+ * route the breach it could not evaluate. A search for the rules that can stop
+ * a write cannot read prose. And a policy DSL states its effect in the rule
+ * head, so a rule whose consequence is only implied by its wording cannot be
+ * lowered into OPA or Cedar.
+ *
+ * A judgment may declare any of the three, `reject` included. What settles a
+ * judgment can decide two identical proposals differently, and `reject` leaves
+ * no appeal, so that pairing is the riskiest thing this model can express. It
+ * is still a bet an organization is entitled to place, and refusing to
+ * represent it would move the policy out of the catalog rather than prevent it.
+ * It is made auditable instead: `evaluation` publishes `judged` beside the
+ * word, so "unappealable rules settled by a model" is one query. `onViolation`
+ * is required on a judgment rather than defaulted, because a forgotten word
+ * would produce exactly that pairing silently.
+ *
+ * A constraint's word is the consequence of the one condition it states. A
+ * policy whose conditions carry different consequences is written as several
+ * constraints, which `guards` on an action lists together; the strictest
+ * consequence among the violated ones is what the action does. See
+ * docs/semantic-model/actions.md for a worked policy.
+ *
+ * STATUS: the declared word is published and read back. Nothing evaluates a
+ * constraint, so nothing routes on it yet.
  */
 export const VIOLATION_EFFECTS = ['reject', 'escalate', 'warn'] as const;
 
@@ -521,11 +552,60 @@ export const CONSTRAINT_SEVERITIES =
 export type ConstraintSeverity = (typeof CONSTRAINT_SEVERITIES)[number];
 
 /**
- * A constraint: a model-level, named invariant over the ontology -- a boolean
- * `expression` that must hold for every instance. It is written in the same
- * expression language as a metric (`Customer.accountBalance >= 0`,
+ * How a constraint is checked, derived from which body it declares.
+ *
+ *   - `deterministic` an `expression`. Computable, reproducible, and the only
+ *                     kind that can lower to a store-level `CHECK` or inform a
+ *                     query plan.
+ *   - `judged`        a `judgment`. Settled by a language model reading the
+ *                     proposed change, because no expression over the ontology
+ *                     decides it.
+ *
+ * Published on the aspect so a consumer can select without knowing which key
+ * the author populated. A pass that lowers constraints to SQL takes the
+ * deterministic ones; a judge takes the judged ones.
+ */
+export const CONSTRAINT_EVALUATIONS = ['deterministic', 'judged'] as const;
+
+export type ConstraintEvaluation = (typeof CONSTRAINT_EVALUATIONS)[number];
+
+/**
+ * How a constraint is checked. Derived rather than authored: a constraint
+ * declares exactly one body, and that choice is the whole of the distinction.
+ */
+export function constraintEvaluation(c: Constraint): ConstraintEvaluation {
+  return c.judgment !== undefined ? 'judged' : 'deterministic';
+}
+
+/**
+ * A constraint: a model-level, named invariant over the ontology. It declares
+ * exactly one body, and the body says how the rule is checked.
+ *
+ * An `expression` is a boolean that must hold for every instance, written in
+ * the same expression language as a metric (`Customer.accountBalance >= 0`,
  * `OrderedAs.quantity > 0`), and may reference a metric by name when the rule
  * needs an aggregate.
+ *
+ * A `judgment` is the same kind of rule stated in words, for the rules that no
+ * expression decides: *the credit memo must name a specific service failure*
+ * is a real requirement with a real owner, and no arithmetic settles it.
+ * Without this body such a rule has nowhere to go but `description`, where
+ * nothing distinguishes it from the message explaining a different rule.
+ *
+ * A judgment states one condition, the same as an expression, because the
+ * consequence is carried by `onViolation` and one word cannot route two
+ * branches. A policy whose branches end differently -- a missing approval is
+ * held for a person, a disguised transaction is refused -- is written as one
+ * constraint per branch, and `guards` on the action lists them together. That
+ * also keeps the branches an expression could decide computable, which is the
+ * distinction the second body exists to draw.
+ *
+ * What the catalog offers a judged rule is identity and governance, never
+ * determinism: one name, one owner, one version, one declared consequence, and
+ * the same text for every caller instead of prose re-improvised per call. A
+ * language model can still decide two identical proposals differently, and no
+ * schema changes that. `onViolation` is required on a judgment so that the
+ * consequence of that non-determinism is always stated rather than inherited.
  *
  * STATUS: authored, validated and published; not yet enforced. kcmd carries a
  * constraint to Knowledge Catalog, where an agent can read the rules a model
@@ -540,14 +620,28 @@ export type ConstraintSeverity = (typeof CONSTRAINT_SEVERITIES)[number];
  */
 export interface Constraint {
   name: string;
-  expression: string;     // boolean invariant in the model's expression language
-  description?: string;   // human-readable summary; also the violation error
-  // What the engine does when this constraint does not hold. Defaults to
-  // `reject`: an unmarked rule refuses the write, which is the safe reading of
-  // an author who did not say. See VIOLATION_EFFECTS.
+  // Exactly one of `expression` and `judgment`. Declaring neither, or both, is
+  // a hard load error: the pair is what tells a consumer whether the rule can
+  // be computed, and a constraint that answers both ways answers neither.
+  expression?: string;  // boolean invariant in the model's expression language
+  // The rule in words, for a rule no expression decides. Write field names
+  // model-qualified (`LineItem.memo` rather than "the memo"): validate resolves
+  // every `Entity.field` token in the text, so the reference is checked, and it
+  // lives in the sentence that uses it rather than in a second list that drifts
+  // from the prose beside it. States one condition, in the form of what must be
+  // true rather than what to do, and says what does not satisfy it: a policy
+  // with several conditions goes in several constraints, regrouped by `guards`
+  // on the action. The consequence goes in `onViolation`, not the prose.
+  judgment?: string;
+  description?: string;  // human-readable summary; also the violation error
+  // What a violation of this constraint does to the write. On an `expression`
+  // it defaults to `reject`: an unmarked rule refuses the write, which is the
+  // safe reading of an author who did not say. On a `judgment` it is required,
+  // any of the three words, because inheriting the harshest one by silence is
+  // not a thing to do to a rule a model settles. See VIOLATION_EFFECTS.
   onViolation?: ViolationEffect;
   // How grave a violation is, for ranking and reporting. Orthogonal to
-  // `onViolation` and carries no default -- an author who did not say has not
+  // `onViolation`, and carries no default -- an author who did not say has not
   // said, and nothing reads it yet. See CONSTRAINT_SEVERITIES.
   severity?: ConstraintSeverity;
   aiContext?: AiContext;

@@ -484,24 +484,66 @@ reads the document ([§6](#6-the-extension-mechanism)).
   whose `operation` is `create`. Those rules are what let every value be bound
   rather than interpolated, so an argument cannot reach the store as SQL.
 
-- **`constraints` (extended profile only).** Model-level named boolean
-  invariants over the ontology, written in the same expression language as a
-  metric — `Account.balance >= 0`. Accepted only under `0.2.0.dev0/google`.
-  A constraint that quantifies over stored data applies to every write without
-  being referenced anywhere. A constraint that reads an action's parameters can
-  be checked only before that call, so it applies only where an action names it
-  in `guards`; one that no action names at all draws a load warning. Status:
-  authored, validated and published; no component evaluates a constraint, so
-  nothing today rejects a write that would break one. Rules in
-  [Reference → Validation](reference.md#validation).
+- **`constraints` (extended profile only).** Model-level named invariants over
+  the ontology, accepted only under `0.2.0.dev0/google`. Each states exactly one
+  condition, in exactly one of two bodies.
+
+  **`expression`** is a boolean written in the same expression language as a
+  metric — `Account.balance >= 0`. **`judgment`** is the rule in words, for a
+  condition no expression decides: whether a discount is justified by the reason
+  given, whether a refund note explains the exception it claims. Field names in
+  a judgment are written model-qualified (`Order.discount_reason` rather than
+  "the reason"), so the reference is checked against the model and lives in the
+  sentence that uses it. A constraint declaring both bodies, or neither, is a
+  load error.
+
+  A judgment states one condition, the same as an expression does. A written
+  policy that branches — a large refund is held for a director, a disguised one
+  is refused, a vague reason is only reported — becomes one constraint per
+  branch, each with its own name, `on_violation` and `severity`, which `guards`
+  on the action lists together. That keeps each branch independently searchable,
+  revisable and owned, and it keeps the branches an expression *can* decide out
+  of prose that no query can read. [Actions → A policy whose rules end
+  differently](actions.md#a-policy-whose-rules-end-differently) works a
+  five-rule credit policy through end to end.
+
+  A constraint takes effect only where something references it. Declaring one
+  adds a rule to the catalog and refuses nothing, so publishing a rule cannot
+  change what an already-working call does. `guards` on an action is the only
+  reference the model defines, and rules of both kinds belong in it: one over an
+  action's parameters has no other moment to run, and one over stored data
+  checks that the call does not start from a broken state. A parameter-reading
+  constraint that no action names draws a load warning, since it can never run.
+  An action whose every guard is judged draws one too: it has no gate a query
+  can decide.
+  Status: authored, validated and published; no component evaluates a
+  constraint, so nothing today rejects a write that would break one, and nothing
+  calls a judge. Rules in [Reference → Validation](reference.md#validation).
 
   A constraint MAY say two things about a violation, under two separate keys.
-  **`on_violation`** is what the engine does to the write that tripped it:
+  **`on_violation`** is what a violation does to the write that tripped it:
   `reject` refuses it outright and nobody may approve it, `escalate` holds it
-  for a human decision, `warn` lets it proceed and reports it. Absent means
-  `reject`, the safe reading of an author who did not say. **`severity`** is how
-  grave the violation is — `critical`, `high`, `medium` or `low` — for ranking
-  and reporting. It carries no default, and nothing ranks or routes on it yet.
+  for a human decision, `warn` lets it proceed and reports it. On an
+  `expression` it defaults to `reject`, the safe reading of an author who did
+  not say. **`severity`** is how grave a violation is — `critical`, `high`,
+  `medium` or `low` — for ranking and reporting. It carries no default, and
+  nothing ranks or routes on it yet.
+
+  When an action's `guards` names several constraints and a write violates more
+  than one, the strictest outcome among them applies: any `reject` refuses the
+  call, failing that any `escalate` holds it, failing that any `warn` lets it
+  through with the violations reported. That combination is fixed and no part of
+  the model states it, which is why an action can name any number of guards
+  without saying how to add them up.
+
+  A `judgment` MUST state `on_violation`, and it MAY be any of the three words.
+  Omitting the key is the only error: an unmarked constraint rejects, and that
+  is too strong a consequence for an author of a judged rule to inherit by
+  silence. Pairing `judgment` with `reject` is the riskiest thing the format can
+  express, because a language model can decide two identical proposals
+  differently and `reject` leaves no appeal. It is published rather than
+  refused, and made findable: the derived `evaluation` field carries `judged`
+  beside the word, so unappealable rules settled by a model are one query.
 
   They are two keys because they answer different questions, and neither one
   implies the other. A `low` rule can still be an absolute refusal, and a
