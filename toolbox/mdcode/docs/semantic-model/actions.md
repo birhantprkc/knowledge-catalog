@@ -155,8 +155,8 @@ that list against reality. The fourth kind, `sql`, contains the write instead.
         executor:
           sql:
             statements:
-              - UPDATE Account SET balance = balance - @amount WHERE accountId = @source
-              - UPDATE Account SET balance = balance + @amount WHERE accountId = @target
+              - UPDATE account SET balance = balance - @amount WHERE account_id = @source
+              - UPDATE account SET balance = balance + @amount WHERE account_id = @target
         parameters:
           - { name: source, type: Account }
           - { name: target, type: Account }
@@ -164,6 +164,34 @@ that list against reality. The fourth kind, `sql`, contains the write instead.
         affects:
           - { concept: Account, operation: modify, fields: [balance] }
 ```
+
+#### The statements are written in database names
+
+Look closely at what those statements say. The entity is `Account` and its field
+is `accountId`, but the statement writes `account` and `account_id` — the table
+and the column that entity is *bound* to, back in `source` and `expression`.
+
+A model gives everything two names, and a metric is written in the first of them:
+you write `Account.balance`, and `kcmd` translates it to `account.balance` before
+any SQL reaches the store. **An action's statements are not translated.** They
+are handed to the store exactly as written, so every table and column in one
+must be the database's own name. The only model names in a statement are the
+`@parameter` references, which name the action's declared parameters.
+
+That is the price of carrying the write verbatim: a rewrite is a place where
+what runs and what was reviewed could come apart.
+
+Nothing catches a model name before the call. Validation checks that each
+statement is one DML verb, contains no `;`, and binds only declared parameters —
+it never asks the store whether a table exists. A model name therefore fails at
+run time, from the store, and the message is not always legible: an entity named
+`Order` bound to a table named `Orders` produces
+
+```
+Syntax error: Unexpected keyword ORDER [at 1:8]
+```
+
+rather than "no such table", because `ORDER` is a reserved word.
 
 Containing the write buys three things a pointer cannot:
 
@@ -198,15 +226,15 @@ refer to the generated key as `@new<Concept>Key`:
           sql:
             statements:
               - >-
-                INSERT INTO Transfer (transferId, amount, debitedId)
+                INSERT INTO transfer (transfer_id, amount, debited_account_id)
                 VALUES (@newTransferKey, @amount, @source)
         affects:
           - { concept: Transfer, operation: create }
 ```
 
-Nothing executes a statement yet. `kcmd` validates the statements, publishes
-them to the catalog and reads them back; what runs them is the action runtime,
-which lands separately.
+A `sql` executor is the only kind `kcmd` itself runs — see
+[Run it](#7-run-it). The other three are published and dispatched by whoever
+reads the model.
 
 ## 2. Gate it with a constraint
 
@@ -523,7 +551,10 @@ read of that parameter.
 
 **Status: nothing evaluates a guard yet.** `kcmd` parses `guards`, resolves each
 name, publishes the list, and reads it back. No component checks a guard against
-live data, so a guard states what must hold before the call and blocks no call.
+live data, so a guard states what must hold before the call and stops no call by
+itself. What it does stop is the call running unchecked:
+[`kcmd action run`](#7-run-it) refuses a guarded action outright rather than
+apply a write the model says is checked first.
 
 ## 3. Say what it changes
 
@@ -700,16 +731,172 @@ each action, so a name, a description, an executor, typed parameters, its
 unchanged. What every part of a model does and does not survive is in
 [What push and pull preserve](fidelity.md).
 
+## 7. Run it
+
+An action with a `sql` executor is a write `kcmd` can perform. Two commands:
+
+```bash
+kcmd action list
+kcmd action run TransferFunds --arg source="Alice Checking" \
+    --arg target=ACC-2 --arg amount=250
+```
+
+That second command does not succeed against the model built up on this page,
+and the reason is worth knowing before the mechanics: `TransferFunds` is guarded
+by `AmountIsPositive`, nothing evaluates a constraint yet, and `kcmd` refuses a
+call rather than apply a write the model says must be checked first. What
+follows describes an action that names no guard, which is what runs today.
+
+`kcmd action list` is what the model declares as runnable — parameters,
+executor, guards, blast radius — and each entry ends with the command line that
+runs it, so reading the listing is enough to make the call:
+
+```
+Model 'payments' (payments_eg), profile 'operational':
+  TransferFunds: Move money from one account to another.
+    parameters: source (Account, reference), target (Account, reference), amount (Float)
+    executor:   sql
+    guards:     AmountIsPositive
+    affects:    Account (modify), Transfer (create)
+    run:        kcmd action run TransferFunds --arg source=<Account> --arg target=<Account> --arg amount=<Float>
+```
+
+### How a row is identified
+
+An entity-typed parameter takes an object reference rather than a value, so
+`--arg source="Alice Checking"` has to become one specific row before anything
+can run. Two separate things decide which rows an action touches, and conflating
+them is the easiest way to misread what an action does.
+
+**Resolving an argument — one row, chosen by `kcmd`.** For each entity-typed
+parameter, `kcmd` runs one lookup against that entity's table before the write:
+
+```sql
+SELECT account_id FROM account
+WHERE account_id = @ref0 OR name = @ref LIMIT 2
+```
+
+The `WHERE` is built from two things the entity declares:
+
+- **its `primary_key`.** `Account` declares `primary_key: [accountId]`, and
+  `accountId` is bound to the column `account_id`, so the input is compared
+  against that column. This is the answer to "how does it know which column is
+  the key" — the model says so; nothing is inferred from the database. One
+  argument cannot name a key of several columns, so an entity keyed that way is
+  reachable only through the identifying field below.
+- **an identifying text field, if the entity has one.** A `String` field that is
+  not part of the key, bound to a plain column, and *named* `name`, `full_name`,
+  `title`, `label` or `display_name`. `Account` declares `name`, so
+  `"Alice Checking"` and the account id both find the same row. The match is on
+  the field's name in the model, not the column's name in the store.
+
+The input is compared against each column as that column's own type, so a key
+declared `Integer` is only compared when the input is a number — `"Alice
+Checking"` is not, so that predicate is dropped rather than cast. If nothing is
+left to compare, no query is sent at all.
+
+Exactly one row must come back. Zero is `No Account matches 'Alice Checking'.`
+Two or more is ambiguous, and the candidates are listed by key so the caller can
+pick one — a name is not required to be unique, and if two accounts carried this
+one:
+
+```
+Error: 'Alice Checking' matches more than one Account (7, 12); use a key to
+disambiguate.
+```
+
+Both are reported rather than guessed at, because both are things the caller can
+act on.
+
+**Targeting the write — however many rows the statement says.** Resolution
+produces a *value*, which the statement then uses. Which rows the write lands on
+is decided entirely by the statement's own `WHERE`, and `kcmd` does not
+constrain it:
+
+```sql
+UPDATE account SET balance = balance - @amount WHERE account_id = @source
+```
+
+This one updates a single row because it filters on the key. A statement reading
+`WHERE status = 'dormant'` would update every dormant account, and nothing would
+stop it. `affects` does not limit the blast radius either — it *declares* it, so
+that a reader knows what the write is about and an evaluator can one day check
+the statements against what was declared. The statement is what decides.
+
+`kcmd action run` does three things:
+
+- **Resolve.** Each entity-typed argument becomes the one row it denotes, as
+  above.
+- **Bind.** Every argument becomes a query parameter of the store type its
+  declared ontology type implies — a `Decimal` amount is compared as a number
+  rather than as text, which is the difference between `9` being less than `10`
+  and not. Nothing is interpolated into a statement.
+- **Apply.** A read-write transaction is opened, the action's statements run
+  inside it in order, and it commits. Any failure before the commit rolls back,
+  so no partial write survives. A commit the store *refuses* wrote nothing
+  either, and is reported that way — the commonest refusal is Spanner's
+  `ABORTED` under lock contention, and the answer to it is to run the action
+  again. What `kcmd` cannot settle for you is a commit that is neither accepted
+  nor refused: a timeout or a 5xx, where the store may have applied the write
+  and lost the response. That one reports the outcome as unknown rather than
+  claiming a rollback, because a caller told "nothing happened" would retry a
+  write that did.
+
+Where the write goes is the model's Spanner deployment target under the selected
+profile. The command line never names a database: `--profile` changes the store,
+the same rule [push](profiles.md) follows.
+
+Only a `sql` executor runs. An `mcp`, `rest` or `grpc` executor names an
+operation in another system, which `kcmd` cannot call and could not roll back if
+the commit failed, so it refuses rather than half-perform the write:
+
+```
+Error: Action 'TransferFunds' is executed by MCP, which runs outside this
+transaction and could not be rolled back if the commit failed. Supply a handler
+that performs the write as DML, or declare the action with a 'sql' executor.
+```
+
+### A guarded action is refused, not run unchecked
+
+Nothing evaluates a constraint yet. A model that declares a rule and a runtime
+that quietly ignores it is worse than no runtime, because the model states the
+write is checked and nothing says otherwise — so `kcmd action run` refuses such
+a call instead:
+
+```
+Error: Action 'TransferFunds' is guarded by 'AmountIsPositive', and this runtime
+does not evaluate constraints yet. Running it would apply a write the model says
+must be checked first, so it is refused rather than run unchecked.
+```
+
+What makes a call "such a call" is `guards`, and only `guards` — the same rule
+[section 2](#2-gate-it-with-a-constraint) states, applied here. A constraint the
+action does not name is a rule this call does not consult, and the runtime does
+not go looking for one: a constraint that merely reads a concept the action
+writes gates nothing, and neither does declaring constraints in a model whose
+action leaves `affects` out. Refusing on either would mean publishing a rule
+could start refusing calls that succeeded the day before, which is exactly what
+making the reference explicit prevents.
+
+A guard whose constraint declares `onViolation: warn` is the one guard that does
+not refuse. Such a rule reports a violation rather than rejecting one, so an
+evaluator would let the write through, and gating on it would leave a model that
+states advisory rules permanently unrunnable.
+
+Every refusal is decided before a session is opened, so a refused action leaves
+no transaction behind.
+
 ## What is not modeled yet
 
 This is a prototype. Three things a reader reasonably expects are absent.
 
-- **Nothing checks the write.** No component evaluates a constraint or a guard,
-  so an action is a declaration and the correctness of what the executor does
-  belongs to the executor.
-- **`kcmd` does not call the executor.** Push publishes the action. Dispatching
-  it is the job of whatever reads the model, which is why the executor names
-  coordinates rather than a statement.
-- **Parameter types are the whole type story.** An entity-typed parameter says
-  which entity an argument denotes. Resolving a caller's `"Alice Checking"` to
-  a row is left to the consumer.
+- **Nothing checks the write.** No component evaluates a constraint or a guard.
+  A guarded action is refused rather than run, so the gap is loud where a model
+  states a rule gates the call, but it is still a gap: the correctness of what a
+  statement does belongs to whoever wrote it.
+- **`kcmd` calls no executor but its own.** A `sql` action runs; an `mcp`,
+  `rest` or `grpc` one is published for whoever dispatches it, which is why
+  those three name coordinates rather than a statement.
+- **The store is Spanner.** `kcmd action run` resolves, binds and transacts
+  against the Spanner database the profile's deployment target names. A model
+  bound to BigQuery publishes its actions and runs none of them.

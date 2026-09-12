@@ -153,6 +153,29 @@ export function validatePushRequirements(
   return errors;
 }
 
+// The subset of the push checks that bear on RUNNING an action rather than on
+// deploying a model. `kcmd action run` skips the deployment checks on purpose
+// -- it deploys nothing -- but it must not skip these, because the runtime acts
+// on exactly what they verify.
+//
+// The `affects` check is the one that matters most. An entry naming a concept
+// the model does not declare is a hard error on push; at run time it would
+// instead reach the binder, which turns an entry whose operation is `create`
+// into a generated key parameter. The key would be minted for a concept that
+// has no table, and the statement binding it would fail at the store reading
+// like a fault in the statement rather than a typo three lines up. Nothing has
+// pruned fields on this path, so the field checks that stand down for a profile
+// push apply in full.
+export function validateRunnable(models: LoadedModel[]): string[] {
+  const errors: string[] = [];
+  for (const {document, model} of models) {
+    errors.push(...validateActions(model, document, false));
+    errors.push(...validateConstraints(model, document, false));
+  }
+  return errors;
+}
+
+
 // Static, target-independent checks for a model's actions. Returns one message
 // per violation. What can be statically wrong once the model has parsed:
 //   - a parameter's type resolves to neither a known entity nor a scalar
